@@ -24,6 +24,7 @@ class Track:
     class_name: str
     bbox: list
     confidence: float
+    raw_confidence: float
     first_seen_ms: int
     last_seen_ms: int
     hits: int = 1
@@ -60,11 +61,12 @@ class IoUTracker:
                 self._next_id += 1
                 self._tracks[track_id] = Track(
                     track_id, detection.class_name, list(detection.bbox),
-                    detection.confidence, now_ms, now_ms)
+                    detection.confidence, detection.confidence, now_ms, now_ms)
             else:
                 track = self._tracks[track_id]
                 unmatched.discard(track_id)
                 track.bbox = list(detection.bbox)
+                track.raw_confidence = detection.confidence
                 track.confidence = round(
                     track.confidence * 0.6 + detection.confidence * 0.4, 4)
                 track.last_seen_ms = now_ms
@@ -82,6 +84,42 @@ class IoUTracker:
 
     def active(self):
         return [track for track in self._tracks.values() if track.confirmed]
+
+
+class ConfidencePolicy:
+    """Three-zone confidence policy with deterministic vision fusion."""
+
+    def __init__(self, review_min=0.25, accept_min=0.60):
+        if not 0.0 <= review_min < accept_min <= 1.0:
+            raise ValueError('confidence thresholds must satisfy 0 <= review < accept <= 1')
+        self.review_min = review_min
+        self.accept_min = accept_min
+
+    def state(self, confidence):
+        if confidence < self.review_min:
+            return 'suppressed'
+        if confidence < self.accept_min:
+            return 'review'
+        return 'accepted'
+
+    def fuse(self, candidate, result):
+        model_confidence = float(candidate['track_confidence'])
+        vision_confidence = float(result['confidence'])
+        confirmed = bool(result['confirmed'])
+        same_class = result.get('class_name') == candidate['class_name']
+        if not confirmed:
+            return {
+                'decision': 'rejected',
+                'effective_class_name': None,
+                'effective_confidence': round(
+                    min(model_confidence, 1.0 - vision_confidence), 4),
+            }
+        return {
+            'decision': 'accepted' if same_class else 'reclassified',
+            'effective_class_name': result['class_name'],
+            'effective_confidence': round(
+                model_confidence * 0.55 + vision_confidence * 0.45, 4),
+        }
 
 
 class SceneEngine:

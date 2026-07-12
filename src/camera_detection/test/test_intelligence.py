@@ -2,7 +2,7 @@ import unittest
 from collections import namedtuple
 
 from camera_detection.intelligence import (
-    CloudGenerator, IoUTracker, SceneEngine, TemplateGenerator,
+    CloudGenerator, ConfidencePolicy, IoUTracker, SceneEngine, TemplateGenerator,
     VisionUnderstandingClient)
 
 
@@ -75,6 +75,37 @@ class IntelligenceTest(unittest.TestCase):
         self.assertFalse(result['confirmed'])
         self.assertIsNone(result['class_name'])
         self.assertEqual(result['confidence'], 1.0)
+
+    def test_tracker_keeps_raw_and_smoothed_confidence(self):
+        self.tracker.update([self.detection], 1000)
+        lower = Detection(0, 'bm', [10, 10, 110, 110], 0.5)
+        track = self.tracker.update([lower], 1001)[0]
+        self.assertEqual(track.raw_confidence, 0.5)
+        self.assertEqual(track.confidence, 0.74)
+
+    def test_confidence_policy_boundaries(self):
+        policy = ConfidencePolicy(0.25, 0.60)
+        self.assertEqual(policy.state(0.2499), 'suppressed')
+        self.assertEqual(policy.state(0.25), 'review')
+        self.assertEqual(policy.state(0.5999), 'review')
+        self.assertEqual(policy.state(0.60), 'accepted')
+
+    def test_confidence_policy_fuses_visual_result(self):
+        policy = ConfidencePolicy()
+        candidate = {'class_name': 'bm', 'track_confidence': 0.5}
+        accepted = policy.fuse(candidate, {
+            'confirmed': True, 'class_name': 'bm', 'confidence': 0.9})
+        self.assertEqual(accepted['decision'], 'accepted')
+        self.assertEqual(accepted['effective_confidence'], 0.68)
+
+        rejected = policy.fuse(candidate, {
+            'confirmed': False, 'class_name': None, 'confidence': 0.8})
+        self.assertEqual(rejected['decision'], 'rejected')
+        self.assertEqual(rejected['effective_confidence'], 0.2)
+
+    def test_confidence_policy_validates_thresholds(self):
+        with self.assertRaises(ValueError):
+            ConfidencePolicy(0.6, 0.6)
 
 
 if __name__ == '__main__':

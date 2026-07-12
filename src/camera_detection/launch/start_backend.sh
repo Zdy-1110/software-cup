@@ -12,7 +12,7 @@ set -e
 : "${H264_BITRATE:=8000}"           # kbps，路由器内网优先保持画质
 : "${H264_GOP:=30}"                 # I帧间隔: 30帧≈1秒，降低剧烈运动时的码率尖峰
 : "${RKNN_MODEL:=/home/teamhd/Downloads/ppyoloe_carrace_rk3588_official_split_int8_416.rknn}"
-: "${CONF_THRESH:=0.3}"
+: "${CONF_THRESH:=0.25}"          # 低于此值直接抑制
 : "${DETECTION_FPS:=30}"
 : "${TELEMETRY_FPS:=20}"
 : "${ROS_DOMAIN_ID:=20}"
@@ -41,8 +41,8 @@ set -e
 : "${UNDERSTANDING_API_KEY:=}"
 : "${UNDERSTANDING_MODEL:=ernie-5.1}"
 : "${UNDERSTANDING_TIMEOUT:=3.0}"
-: "${UNDERSTANDING_CONF_MIN:=0.30}"
-: "${UNDERSTANDING_CONF_MAX:=0.55}"
+: "${UNDERSTANDING_CONF_MIN:=0.25}" # 0.25-0.60 进入视觉复核
+: "${UNDERSTANDING_CONF_MAX:=0.60}" # >=0.60 由三帧轨迹直接接受
 : "${UNDERSTANDING_COOLDOWN:=30}"
 
 MODE=${1:-all}    # video | detect | all

@@ -41,7 +41,7 @@ INFER_WIDTH     = 416
 INFER_HEIGHT    = 416
 _SCALE_X        = SOURCE_WIDTH / INFER_WIDTH
 _SCALE_Y        = SOURCE_HEIGHT / INFER_HEIGHT
-CONF_THRESH     = float(os.environ.get('CONF_THRESH', '0.3'))
+CONF_THRESH     = float(os.environ.get('CONF_THRESH', '0.25'))
 NMS_THRESH      = float(os.environ.get('NMS_THRESH',  '0.45'))
 # ppyoloe 输出类别（根据实际模型调整）
 CLASS_NAMES     = os.environ.get('CLASS_NAMES',

@@ -39,6 +39,7 @@ from camera_detection.detection_server import (
 )
 from camera_detection.intelligence import (
     CloudGenerator,
+    ConfidencePolicy,
     IoUTracker,
     SceneEngine,
     TemplateGenerator,
@@ -72,8 +73,8 @@ UNDERSTANDING_API_URL = os.environ.get(
 UNDERSTANDING_API_KEY = os.environ.get('UNDERSTANDING_API_KEY', '')
 UNDERSTANDING_MODEL = os.environ.get('UNDERSTANDING_MODEL', 'ernie-5.1')
 UNDERSTANDING_TIMEOUT = float(os.environ.get('UNDERSTANDING_TIMEOUT', '3.0'))
-UNDERSTANDING_CONF_MIN = float(os.environ.get('UNDERSTANDING_CONF_MIN', '0.30'))
-UNDERSTANDING_CONF_MAX = float(os.environ.get('UNDERSTANDING_CONF_MAX', '0.55'))
+UNDERSTANDING_CONF_MIN = float(os.environ.get('UNDERSTANDING_CONF_MIN', '0.25'))
+UNDERSTANDING_CONF_MAX = float(os.environ.get('UNDERSTANDING_CONF_MAX', '0.60'))
 UNDERSTANDING_COOLDOWN = float(os.environ.get('UNDERSTANDING_COOLDOWN', '30'))
 
 
@@ -178,6 +179,8 @@ class UnifiedServer:
         self._understanding = VisionUnderstandingClient(
             UNDERSTANDING_API_URL, UNDERSTANDING_API_KEY,
             UNDERSTANDING_MODEL, UNDERSTANDING_TIMEOUT)
+        self._confidence_policy = ConfidencePolicy(
+            UNDERSTANDING_CONF_MIN, UNDERSTANDING_CONF_MAX)
         self._understanding_executor = ThreadPoolExecutor(max_workers=1)
         self._understanding_slot = threading.BoundedSemaphore(1)
         self._understanding_last: dict[int, float] = {}
@@ -383,15 +386,14 @@ class UnifiedServer:
                 time.sleep(target_interval - elapsed)
             self._maybe_log_stats()
 
-    @staticmethod
-    def _build_detection_payload(detections: list, latency_ms: float,
+    def _build_detection_payload(self, detections: list, latency_ms: float,
                                  frame_id: int, pts_ns: int, capture_ts: float) -> dict:
         now = time.time()
         sec = int(now)
         cap_sec = int(capture_ts)
         return {
             'type': 'detection',
-            'version': 1,
+            'version': 2,
             'stamp': {'sec': sec, 'nanosec': int((now - sec) * 1e9)},
             'frame_id': frame_id,
             'frame_pts_ns': pts_ns,
@@ -408,6 +410,10 @@ class UnifiedServer:
                     'class_name': d.class_name,
                     'bbox': d.bbox,
                     'confidence': d.confidence,
+                    'raw_confidence': d.raw_confidence,
+                    'track_confidence': d.confidence,
+                    'confidence_state': self._confidence_policy.state(
+                        d.confidence),
                 }
                 for d in detections
             ],
@@ -468,12 +474,17 @@ class UnifiedServer:
         if not self._understanding.enabled:
             return
         now = time.monotonic()
-        candidate = next((track for track in tracks
-                          if track.confirmed
-                          and UNDERSTANDING_CONF_MIN <= track.confidence
-                          < UNDERSTANDING_CONF_MAX
-                          and now - self._understanding_last.get(
-                              track.track_id, 0) >= UNDERSTANDING_COOLDOWN), None)
+        candidates = [
+            track for track in tracks
+            if track.confirmed
+            and self._confidence_policy.state(track.confidence) == 'review'
+            and now - self._understanding_last.get(
+                track.track_id, 0) >= UNDERSTANDING_COOLDOWN
+        ]
+        candidate = min(
+            candidates,
+            key=lambda track: abs(track.confidence - UNDERSTANDING_CONF_MAX),
+            default=None)
         if candidate is None or not self._understanding_slot.acquire(False):
             return
         with self._jpeg_lock:
@@ -484,7 +495,10 @@ class UnifiedServer:
         self._understanding_last[candidate.track_id] = now
         payload = {
             'track_id': candidate.track_id, 'class_name': candidate.class_name,
-            'confidence': candidate.confidence, 'bbox': candidate.bbox,
+            'confidence': candidate.confidence,
+            'raw_confidence': candidate.raw_confidence,
+            'track_confidence': candidate.confidence,
+            'bbox': candidate.bbox,
         }
 
         def task():
@@ -492,11 +506,13 @@ class UnifiedServer:
                 result = self._understanding.confirm(jpeg, payload, CLASS_NAMES)
                 if not result or not self._loop:
                     return
+                fusion = self._confidence_policy.fuse(payload, result)
                 message = {
-                    'type': 'understanding', 'version': 1,
+                    'type': 'understanding', 'version': 2,
                     'frame_id': frame_id, 'track_id': candidate.track_id,
                     'scene_revision': revision, 'source': UNDERSTANDING_MODEL,
                     'candidate': payload, 'result': result,
+                    **fusion,
                     'stamp_ms': round(time.time() * 1000),
                 }
                 if candidate.track_id not in self._active_track_ids:
