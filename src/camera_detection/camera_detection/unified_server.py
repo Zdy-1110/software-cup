@@ -79,7 +79,7 @@ UNDERSTANDING_MODEL = os.environ.get(
     'UNDERSTANDING_MODEL', 'ernie-4.5-turbo-vl')
 UNDERSTANDING_TIMEOUT = float(os.environ.get('UNDERSTANDING_TIMEOUT', '3.0'))
 UNDERSTANDING_CONF_MIN = float(os.environ.get('UNDERSTANDING_CONF_MIN', '0.25'))
-UNDERSTANDING_CONF_MAX = float(os.environ.get('UNDERSTANDING_CONF_MAX', '0.60'))
+UNDERSTANDING_CONF_MAX = float(os.environ.get('UNDERSTANDING_CONF_MAX', '0.50'))
 UNDERSTANDING_COOLDOWN = float(os.environ.get('UNDERSTANDING_COOLDOWN', '30'))
 HUD_API_URL = os.environ.get(
     'HUD_API_URL', 'https://qianfan.baidubce.com/v2')

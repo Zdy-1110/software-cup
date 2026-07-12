@@ -41,8 +41,8 @@ set -e
 : "${UNDERSTANDING_API_KEY:=}"
 : "${UNDERSTANDING_MODEL:=ernie-4.5-turbo-vl}"
 : "${UNDERSTANDING_TIMEOUT:=3.0}"
-: "${UNDERSTANDING_CONF_MIN:=0.25}" # 0.25-0.60 进入视觉复核
-: "${UNDERSTANDING_CONF_MAX:=0.60}" # >=0.60 由三帧轨迹直接接受
+: "${UNDERSTANDING_CONF_MIN:=0.25}" # 0.25-0.50 进入视觉复核
+: "${UNDERSTANDING_CONF_MAX:=0.50}" # >0.50 连续三个检测周期后生成 HUD
 : "${UNDERSTANDING_COOLDOWN:=30}"
 
 # ERNIE 文本生成层（可与视觉理解共用 API key，但使用独立模型）

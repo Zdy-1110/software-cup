@@ -85,11 +85,12 @@ class IntelligenceTest(unittest.TestCase):
         self.assertEqual(track.confidence, 0.74)
 
     def test_confidence_policy_boundaries(self):
-        policy = ConfidencePolicy(0.25, 0.60)
+        policy = ConfidencePolicy(0.25, 0.50)
         self.assertEqual(policy.state(0.2499), 'suppressed')
         self.assertEqual(policy.state(0.25), 'review')
-        self.assertEqual(policy.state(0.5999), 'review')
-        self.assertEqual(policy.state(0.60), 'accepted')
+        self.assertEqual(policy.state(0.4999), 'review')
+        self.assertEqual(policy.state(0.50), 'review')
+        self.assertEqual(policy.state(0.5001), 'accepted')
 
     def test_confidence_policy_fuses_visual_result(self):
         policy = ConfidencePolicy()
@@ -167,11 +168,11 @@ class IntelligenceTest(unittest.TestCase):
 
     def test_acceptance_gate_requires_three_consecutive_updates(self):
         gate = AcceptanceGate(required_hits=3)
-        policy = ConfidencePolicy(0.25, 0.60)
+        policy = ConfidencePolicy(0.25, 0.50)
         for frame in range(3):
             tracks = self.tracker.update([self.detection], 1000 + frame)
         track = tracks[0]
-        track.confidence = 0.61
+        track.confidence = 0.51
         self.assertEqual(gate.update([track], policy), [])
         self.assertEqual(gate.update([track], policy), [])
         self.assertEqual(gate.update([track], policy), [track])
@@ -179,15 +180,15 @@ class IntelligenceTest(unittest.TestCase):
 
     def test_acceptance_gate_resets_after_review(self):
         gate = AcceptanceGate(required_hits=2)
-        policy = ConfidencePolicy(0.25, 0.60)
+        policy = ConfidencePolicy(0.25, 0.50)
         for frame in range(3):
             tracks = self.tracker.update([self.detection], 1000 + frame)
         track = tracks[0]
-        track.confidence = 0.61
+        track.confidence = 0.51
         gate.update([track], policy)
-        track.confidence = 0.59
+        track.confidence = 0.49
         gate.update([track], policy)
-        track.confidence = 0.61
+        track.confidence = 0.51
         self.assertEqual(gate.update([track], policy), [])
         self.assertEqual(gate.update([track], policy), [track])
 

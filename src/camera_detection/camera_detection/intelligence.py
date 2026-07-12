@@ -154,7 +154,7 @@ class IoUTracker:
 class ConfidencePolicy:
     """Three-zone confidence policy with deterministic vision fusion."""
 
-    def __init__(self, review_min=0.25, accept_min=0.60):
+    def __init__(self, review_min=0.25, accept_min=0.50):
         if not 0.0 <= review_min < accept_min <= 1.0:
             raise ValueError('confidence thresholds must satisfy 0 <= review < accept <= 1')
         self.review_min = review_min
@@ -163,7 +163,7 @@ class ConfidencePolicy:
     def state(self, confidence):
         if confidence < self.review_min:
             return 'suppressed'
-        if confidence < self.accept_min:
+        if confidence <= self.accept_min:
             return 'review'
         return 'accepted'
 
