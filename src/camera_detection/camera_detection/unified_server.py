@@ -71,7 +71,8 @@ CLOUD_API_TIMEOUT = float(os.environ.get('CLOUD_API_TIMEOUT', '2.5'))
 UNDERSTANDING_API_URL = os.environ.get(
     'UNDERSTANDING_API_URL', 'https://qianfan.baidubce.com/v2')
 UNDERSTANDING_API_KEY = os.environ.get('UNDERSTANDING_API_KEY', '')
-UNDERSTANDING_MODEL = os.environ.get('UNDERSTANDING_MODEL', 'ernie-5.1')
+UNDERSTANDING_MODEL = os.environ.get(
+    'UNDERSTANDING_MODEL', 'ernie-4.5-turbo-vl')
 UNDERSTANDING_TIMEOUT = float(os.environ.get('UNDERSTANDING_TIMEOUT', '3.0'))
 UNDERSTANDING_CONF_MIN = float(os.environ.get('UNDERSTANDING_CONF_MIN', '0.25'))
 UNDERSTANDING_CONF_MAX = float(os.environ.get('UNDERSTANDING_CONF_MAX', '0.60'))

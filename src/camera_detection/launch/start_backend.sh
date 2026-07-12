@@ -39,7 +39,7 @@ set -e
 # 千帆视觉理解（二次确认，可选；密钥仅通过运行环境注入）
 : "${UNDERSTANDING_API_URL:=https://qianfan.baidubce.com/v2}"
 : "${UNDERSTANDING_API_KEY:=}"
-: "${UNDERSTANDING_MODEL:=ernie-5.1}"
+: "${UNDERSTANDING_MODEL:=ernie-4.5-turbo-vl}"
 : "${UNDERSTANDING_TIMEOUT:=3.0}"
 : "${UNDERSTANDING_CONF_MIN:=0.25}" # 0.25-0.60 进入视觉复核
 : "${UNDERSTANDING_CONF_MAX:=0.60}" # >=0.60 由三帧轨迹直接接受

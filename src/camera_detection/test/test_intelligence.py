@@ -64,7 +64,7 @@ class IntelligenceTest(unittest.TestCase):
 
     def test_visual_understanding_disabled_without_key(self):
         client = VisionUnderstandingClient(
-            'https://qianfan.baidubce.com/v2', '', 'ernie-5.1')
+            'https://qianfan.baidubce.com/v2', '', 'ernie-4.5-turbo-vl')
         self.assertFalse(client.enabled)
         self.assertIsNone(client.confirm(b'jpeg', {}, ['bm']))
 
