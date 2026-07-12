@@ -42,6 +42,7 @@ from camera_detection.intelligence import (
     ConfidencePolicy,
     HudCardGenerator,
     IoUTracker,
+    LANDMARK_CARDS,
     SceneEngine,
     TemplateGenerator,
     VisionUnderstandingClient,
@@ -82,7 +83,8 @@ HUD_API_URL = os.environ.get(
     'HUD_API_URL', 'https://qianfan.baidubce.com/v2')
 HUD_API_KEY = os.environ.get('HUD_API_KEY', '')
 HUD_API_MODEL = os.environ.get('HUD_API_MODEL', 'ernie-5.1')
-HUD_API_TIMEOUT = float(os.environ.get('HUD_API_TIMEOUT', '5.0'))
+HUD_API_TIMEOUT = float(os.environ.get('HUD_API_TIMEOUT', '0.8'))
+HUD_REPEAT_INTERVAL = float(os.environ.get('HUD_REPEAT_INTERVAL', '3.0'))
 try:
     CLASS_DISPLAY_NAMES = json.loads(os.environ.get('CLASS_DISPLAY_NAMES', '{}'))
 except json.JSONDecodeError:
@@ -199,7 +201,7 @@ class UnifiedServer:
             HUD_API_URL, HUD_API_KEY, HUD_API_MODEL, HUD_API_TIMEOUT)
         self._hud_executor = ThreadPoolExecutor(max_workers=1)
         self._hud_slots = threading.BoundedSemaphore(2)
-        self._hud_generated: set[tuple[int, str]] = set()
+        self._hud_last_by_class: dict[str, float] = {}
         self._jpeg_lock = threading.Lock()
         self._jpeg_by_frame: OrderedDict[int, bytes] = OrderedDict()
         self._scene_revision = 0
@@ -502,14 +504,19 @@ class UnifiedServer:
 
     @staticmethod
     def _display_name(class_name: str) -> str:
-        value = CLASS_DISPLAY_NAMES.get(class_name, class_name)
+        value = CLASS_DISPLAY_NAMES.get(
+            class_name, LANDMARK_CARDS.get(class_name, {}).get(
+                'display_name', class_name))
         return str(value).strip()[:24] or class_name
 
     def _submit_hud_card(self, context: dict):
-        cache_key = (context['track_id'], context['class_name'])
-        if cache_key in self._hud_generated or not self._hud_slots.acquire(False):
+        now = time.monotonic()
+        class_name = context['class_name']
+        if (now - self._hud_last_by_class.get(class_name, 0.0)
+                < HUD_REPEAT_INTERVAL or not self._hud_slots.acquire(False)):
             return
-        self._hud_generated.add(cache_key)
+        self._hud_last_by_class[class_name] = now
+        context['reference'] = dict(LANDMARK_CARDS.get(class_name, {}))
 
         def task():
             try:

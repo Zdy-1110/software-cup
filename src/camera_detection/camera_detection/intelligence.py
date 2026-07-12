@@ -8,6 +8,70 @@ import urllib.request
 import uuid
 
 
+LANDMARK_CARDS = {
+    'bm': {
+        'display_name': '斑马', 'title': '斑马·草原精灵',
+        'subtitle': '非洲大草原',
+        'body': '斑马的黑白条纹是进化的奇迹，每头斑马的纹路如指纹般独一无二，是大自然最美的艺术。',
+        'tags': ['非洲草原', '神奇居民'], 'cta': '扫描线进场',
+    },
+    'cjl': {
+        'display_name': '长颈鹿', 'title': '长颈鹿·高天守望者',
+        'subtitle': '非洲稀树草原',
+        'body': '地球上最高的陆地动物，2米长的脖子每天只需喝少量的水，却能俯瞰整片草原的风景。',
+        'tags': ['草原', '优雅身影'], 'cta': '从上方滑入',
+    },
+    'jsjd': {
+        'display_name': '金沙酒店', 'title': '金沙酒店·城市地标',
+        'subtitle': '当代文旅综合体',
+        'body': '弧形玻璃幕墙倒映城市天际线，融购物、文化与美食于一体，是现代都市文旅的璀璨坐标。',
+        'tags': ['都市文旅', '璀璨坐标'], 'cta': '光扫过建筑轮廓',
+    },
+    'jzt': {
+        'display_name': '吉萨金字塔', 'title': '金字塔·永恒之墓',
+        'subtitle': '古埃及·世界奇迹',
+        'body': '建于约4500年前，由230万块石头砌成，每块重达2.5吨。它如何建造，至今仍是谜。',
+        'tags': ['古埃及', '人类奇迹'], 'cta': '沙尘粒子进场',
+    },
+    'lu': {
+        'display_name': '鹿', 'title': '鹿·森林使者',
+        'subtitle': '温带森林生态',
+        'body': '鹿角每年脱落后重新生长，是自然界中最快速的骨骼再生奇观，堪称生命力的象征。',
+        'tags': ['森林', '柔韧生命'], 'cta': '树叶飘落动效',
+    },
+    'mtl': {
+        'display_name': '摩天轮', 'title': '摩天轮·云端之眼',
+        'subtitle': '城市娱乐地标',
+        'body': '高耸的摩天轮能把你送到城市上空，让你在云端俯瞰整座城市的灯火与轮廓。',
+        'tags': ['城市夜景', '浪漫坐标'], 'cta': '缓慢旋转光圈',
+    },
+    'nc': {
+        'display_name': '鸟巢', 'title': '鸟巢·钢铁筑梦',
+        'subtitle': '国家体育场·北京',
+        'body': '2008年北京奥运主场馆，9万吨钢材编织成独特的鸟巢造型，承载着中国体育的荣耀与梦想。',
+        'tags': ['中国体育', '永恒象征'], 'cta': '钢架网格动效',
+    },
+    'tt': {
+        'display_name': '埃菲尔铁塔', 'title': '铁塔·铁铸浪漫',
+        'subtitle': '巴黎·法国地标',
+        'body': '建于1889年，原计划仅保留20年后拆除，如今已成为全球最知名的地标，象征浪漫与创造力。',
+        'tags': ['巴黎天际线', '优雅铁架'], 'cta': '灯光闪烁动效',
+    },
+    'ydm': {
+        'display_name': '印度门', 'title': '印度门·荣耀之拱',
+        'subtitle': '新德里·历史地标',
+        'body': '42米高的拱形纪念碑，铭刻着约9万名一战阵亡印度士兵的名字，是南亚大陆的历史丰碑。',
+        'tags': ['南亚大陆', '历史丰碑'], 'cta': '拱形光晕扩散',
+    },
+    'zynsx': {
+        'display_name': '自由女神', 'title': '自由女神·自由之光',
+        'subtitle': '纽约·美国象征',
+        'body': '法国人民赠给美国的礼物，铜像内藏旋转楼梯，火炬顶端可俯瞰纽约湾，象征自由与希望。',
+        'tags': ['自由', '希望'], 'cta': '火炬光芒放射',
+    },
+}
+
+
 def bbox_iou(a, b) -> float:
     x1, y1 = max(a[0], b[0]), max(a[1], b[1])
     x2, y2 = min(a[2], b[2]), min(a[3], b[3])
@@ -217,14 +281,17 @@ class HudCardGenerator:
             'class_name': context['class_name'],
             'display_name': context['display_name'],
             'confidence': context['confidence'],
+            'reference': context.get('reference', {}),
             'telemetry': context.get('telemetry', {}),
         }
         prompt = (
-            '你是智能车HUD卡片生成器。只能依据给定JSON，不得猜测类别缩写或补充'
-            '未经提供的事实。严格返回一个JSON对象，不要Markdown，格式为：'
-            '{"title":"不超过12字","summary":"不超过40字",'
-            '"facts":[{"label":"不超过8字","value":"不超过16字"}]}。'
-            'facts最多3项。输入：' + json.dumps(trusted, ensure_ascii=False))
+            '你是一位未来文旅AR副驾助手，语气简洁、有趣、充满知识感。'
+            '只能依据给定JSON，不得猜测类别缩写或补充未经提供的事实。'
+            '严格返回一个JSON对象，不要Markdown，不要任何多余文字，格式为：'
+            '{"title":"10字以内","subtitle":"15字以内",'
+            '"body":"不超过60字","tags":["标签1","标签2"],'
+            '"cta":"行动提示"}。输入：' +
+            json.dumps(trusted, ensure_ascii=False))
         body = json.dumps({
             'model': self.model,
             'messages': [{'role': 'user', 'content': prompt}],
@@ -246,25 +313,26 @@ class HudCardGenerator:
     def validate_content(content):
         if not isinstance(content, dict):
             raise ValueError('HUD response must be an object')
-        if set(content) != {'title', 'summary', 'facts'}:
+        required = {'title', 'subtitle', 'body', 'tags', 'cta'}
+        if set(content) != required:
             raise ValueError('HUD response has invalid fields')
         title = str(content['title']).strip()
-        summary = str(content['summary']).strip()
-        facts = content['facts']
-        if not title or len(title) > 24 or not summary or len(summary) > 80:
+        subtitle = str(content['subtitle']).strip()
+        body = str(content['body']).strip()
+        cta = str(content['cta']).strip()
+        tags = content['tags']
+        if (not title or len(title) > 10 or not subtitle or len(subtitle) > 15
+            or not body or len(body) > 60 or not cta or len(cta) > 12):
             raise ValueError('HUD text is empty or too long')
-        if not isinstance(facts, list) or len(facts) > 3:
-            raise ValueError('HUD facts must be a list with at most 3 items')
-        normalized = []
-        for fact in facts:
-            if not isinstance(fact, dict) or set(fact) != {'label', 'value'}:
-                raise ValueError('HUD fact has invalid fields')
-            label = str(fact['label']).strip()
-            value = str(fact['value']).strip()
-            if not label or len(label) > 16 or not value or len(value) > 32:
-                raise ValueError('HUD fact is empty or too long')
-            normalized.append({'label': label, 'value': value})
-        return {'title': title, 'summary': summary, 'facts': normalized}
+        if not isinstance(tags, list) or not 1 <= len(tags) <= 3:
+            raise ValueError('HUD tags must contain 1 to 3 items')
+        normalized_tags = [str(tag).strip() for tag in tags]
+        if any(not tag or len(tag) > 16 for tag in normalized_tags):
+            raise ValueError('HUD tag is empty or too long')
+        return {
+            'title': title, 'subtitle': subtitle, 'body': body,
+            'tags': normalized_tags, 'cta': cta,
+        }
 
     @staticmethod
     def build_card(context, content, source):
@@ -280,18 +348,25 @@ class HudCardGenerator:
             'confidence': round(float(context['confidence']), 4),
             'source': source,
             **content,
+            'presentation': {
+                'enter_duration_ms': 300,
+                'max_visible_cards': 3,
+                'cloud_fallback_ms': 800,
+            },
             'severity': 'info', 'generated_at': now_ms,
             'expires_at': now_ms + 15000,
         }
 
     @classmethod
     def template(cls, context):
+        reference = context.get('reference') or {}
         display_name = context['display_name']
         content = {
-            'title': display_name,
-            'summary': f'检测到{display_name}',
-            'facts': [{'label': '置信度',
-                       'value': f"{float(context['confidence']):.0%}"}],
+            'title': reference.get('title', display_name),
+            'subtitle': reference.get('subtitle', '智能识别目标'),
+            'body': reference.get('body', f'检测到{display_name}'),
+            'tags': reference.get('tags', ['智能识别']),
+            'cta': reference.get('cta', '继续探索'),
         }
         return cls.build_card(context, content, 'template')
 

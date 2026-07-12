@@ -3,7 +3,7 @@ from collections import namedtuple
 
 from camera_detection.intelligence import (
     CloudGenerator, ConfidencePolicy, HudCardGenerator, IoUTracker, SceneEngine,
-    TemplateGenerator, VisionUnderstandingClient)
+    LANDMARK_CARDS, TemplateGenerator, VisionUnderstandingClient)
 
 
 Detection = namedtuple('Detection', ['id', 'class_name', 'bbox', 'confidence'])
@@ -122,8 +122,9 @@ class IntelligenceTest(unittest.TestCase):
     def test_hud_card_binds_trusted_context(self):
         generator = HudCardGenerator('https://example.test', 'key', 'ernie-5.1')
         generator._request = lambda context: {
-            'title': '赛道目标', 'summary': '检测到目标',
-            'facts': [{'label': '状态', 'value': '已确认'}],
+            'title': '斑马·草原精灵', 'subtitle': '非洲大草原',
+            'body': '斑马拥有独特的黑白条纹。',
+            'tags': ['草原', '动物'], 'cta': '继续探索',
         }
         context = {
             'event_id': 'event-4', 'track_id': 8, 'scene_revision': 15,
@@ -138,16 +139,29 @@ class IntelligenceTest(unittest.TestCase):
     def test_hud_card_rejects_invalid_model_fields(self):
         with self.assertRaises(ValueError):
             HudCardGenerator.validate_content({
-                'title': '目标', 'summary': '检测到目标', 'facts': [],
+                'title': '目标', 'subtitle': '地标', 'body': '检测到目标',
+                'tags': ['识别'], 'cta': '继续探索',
                 'track_id': 999,
             })
 
-    def test_hud_card_rejects_oversized_facts(self):
+    def test_hud_card_rejects_oversized_tags(self):
         with self.assertRaises(ValueError):
             HudCardGenerator.validate_content({
-                'title': '目标', 'summary': '检测到目标',
-                'facts': [{'label': '类别', 'value': '目标'}] * 4,
+                'title': '目标', 'subtitle': '地标', 'body': '检测到目标',
+                'tags': ['一', '二', '三', '四'], 'cta': '继续探索',
             })
+
+    def test_landmark_metadata_covers_all_model_classes(self):
+        expected = {'bm', 'cjl', 'jsjd', 'jzt', 'lu', 'mtl',
+                    'nc', 'tt', 'ydm', 'zynsx'}
+        self.assertEqual(set(LANDMARK_CARDS), expected)
+        for metadata in LANDMARK_CARDS.values():
+            self.assertTrue(metadata['display_name'])
+            self.assertLessEqual(len(metadata['title']), 10)
+            self.assertLessEqual(len(metadata['subtitle']), 15)
+            self.assertLessEqual(len(metadata['body']), 60)
+            self.assertLessEqual(len(metadata['cta']), 12)
+            self.assertGreaterEqual(len(metadata['tags']), 1)
 
 
 if __name__ == '__main__':
