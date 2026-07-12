@@ -45,6 +45,13 @@ set -e
 : "${UNDERSTANDING_CONF_MAX:=0.60}" # >=0.60 由三帧轨迹直接接受
 : "${UNDERSTANDING_COOLDOWN:=30}"
 
+# ERNIE 文本生成层（可与视觉理解共用 API key，但使用独立模型）
+: "${HUD_API_URL:=https://qianfan.baidubce.com/v2}"
+: "${HUD_API_KEY:=}"
+: "${HUD_API_MODEL:=ernie-5.1}"
+: "${HUD_API_TIMEOUT:=5.0}"
+: "${CLASS_DISPLAY_NAMES:={}}"    # JSON，例如 {"bm":"斑马线"}
+
 MODE=${1:-all}    # video | detect | all
 
 mkdir -p "$LOG_DIR"
@@ -65,6 +72,7 @@ export CLOUD_API_URL CLOUD_API_KEY CLOUD_API_MODEL CLOUD_API_TIMEOUT
 export UNDERSTANDING_API_URL UNDERSTANDING_API_KEY UNDERSTANDING_MODEL
 export UNDERSTANDING_TIMEOUT UNDERSTANDING_CONF_MIN UNDERSTANDING_CONF_MAX
 export UNDERSTANDING_COOLDOWN
+export HUD_API_URL HUD_API_KEY HUD_API_MODEL HUD_API_TIMEOUT CLASS_DISPLAY_NAMES
 
 # ── 检查摄像头 ───────────────────────────────────────────────
 if [ ! -e "$VIDEO_DEVICE" ]; then

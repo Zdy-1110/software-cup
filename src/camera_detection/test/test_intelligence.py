@@ -2,8 +2,8 @@ import unittest
 from collections import namedtuple
 
 from camera_detection.intelligence import (
-    CloudGenerator, ConfidencePolicy, IoUTracker, SceneEngine, TemplateGenerator,
-    VisionUnderstandingClient)
+    CloudGenerator, ConfidencePolicy, HudCardGenerator, IoUTracker, SceneEngine,
+    TemplateGenerator, VisionUnderstandingClient)
 
 
 Detection = namedtuple('Detection', ['id', 'class_name', 'bbox', 'confidence'])
@@ -106,6 +106,48 @@ class IntelligenceTest(unittest.TestCase):
     def test_confidence_policy_validates_thresholds(self):
         with self.assertRaises(ValueError):
             ConfidencePolicy(0.6, 0.6)
+
+    def test_hud_card_falls_back_without_credentials(self):
+        generator = HudCardGenerator('', '', '')
+        context = {
+            'event_id': 'event-3', 'track_id': 4, 'scene_revision': 12,
+            'class_name': 'nc', 'display_name': 'nc', 'confidence': 0.68,
+        }
+        card = generator.generate(context)
+        self.assertEqual(card['type'], 'hud_card')
+        self.assertEqual(card['source'], 'template')
+        self.assertEqual(card['track_id'], 4)
+        self.assertEqual(card['class_name'], 'nc')
+
+    def test_hud_card_binds_trusted_context(self):
+        generator = HudCardGenerator('https://example.test', 'key', 'ernie-5.1')
+        generator._request = lambda context: {
+            'title': '赛道目标', 'summary': '检测到目标',
+            'facts': [{'label': '状态', 'value': '已确认'}],
+        }
+        context = {
+            'event_id': 'event-4', 'track_id': 8, 'scene_revision': 15,
+            'class_name': 'bm', 'display_name': 'bm', 'confidence': 0.72,
+        }
+        card = generator.generate(context)
+        self.assertEqual(card['event_id'], 'event-4')
+        self.assertEqual(card['track_id'], 8)
+        self.assertEqual(card['scene_revision'], 15)
+        self.assertEqual(card['source'], 'ernie-5.1')
+
+    def test_hud_card_rejects_invalid_model_fields(self):
+        with self.assertRaises(ValueError):
+            HudCardGenerator.validate_content({
+                'title': '目标', 'summary': '检测到目标', 'facts': [],
+                'track_id': 999,
+            })
+
+    def test_hud_card_rejects_oversized_facts(self):
+        with self.assertRaises(ValueError):
+            HudCardGenerator.validate_content({
+                'title': '目标', 'summary': '检测到目标',
+                'facts': [{'label': '类别', 'value': '目标'}] * 4,
+            })
 
 
 if __name__ == '__main__':

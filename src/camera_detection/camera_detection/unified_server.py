@@ -40,6 +40,7 @@ from camera_detection.detection_server import (
 from camera_detection.intelligence import (
     CloudGenerator,
     ConfidencePolicy,
+    HudCardGenerator,
     IoUTracker,
     SceneEngine,
     TemplateGenerator,
@@ -77,6 +78,15 @@ UNDERSTANDING_TIMEOUT = float(os.environ.get('UNDERSTANDING_TIMEOUT', '3.0'))
 UNDERSTANDING_CONF_MIN = float(os.environ.get('UNDERSTANDING_CONF_MIN', '0.25'))
 UNDERSTANDING_CONF_MAX = float(os.environ.get('UNDERSTANDING_CONF_MAX', '0.60'))
 UNDERSTANDING_COOLDOWN = float(os.environ.get('UNDERSTANDING_COOLDOWN', '30'))
+HUD_API_URL = os.environ.get(
+    'HUD_API_URL', 'https://qianfan.baidubce.com/v2')
+HUD_API_KEY = os.environ.get('HUD_API_KEY', '')
+HUD_API_MODEL = os.environ.get('HUD_API_MODEL', 'ernie-5.1')
+HUD_API_TIMEOUT = float(os.environ.get('HUD_API_TIMEOUT', '5.0'))
+try:
+    CLASS_DISPLAY_NAMES = json.loads(os.environ.get('CLASS_DISPLAY_NAMES', '{}'))
+except json.JSONDecodeError:
+    CLASS_DISPLAY_NAMES = {}
 
 
 class TelemetryBridge(Node):
@@ -185,6 +195,11 @@ class UnifiedServer:
         self._understanding_executor = ThreadPoolExecutor(max_workers=1)
         self._understanding_slot = threading.BoundedSemaphore(1)
         self._understanding_last: dict[int, float] = {}
+        self._hud_generator = HudCardGenerator(
+            HUD_API_URL, HUD_API_KEY, HUD_API_MODEL, HUD_API_TIMEOUT)
+        self._hud_executor = ThreadPoolExecutor(max_workers=1)
+        self._hud_slots = threading.BoundedSemaphore(2)
+        self._hud_generated: set[tuple[int, str]] = set()
         self._jpeg_lock = threading.Lock()
         self._jpeg_by_frame: OrderedDict[int, bytes] = OrderedDict()
         self._scene_revision = 0
@@ -375,6 +390,20 @@ class UnifiedServer:
                 messages.append(json.dumps(
                     self._template_generator.generate(event, scene['revision'])))
                 self._submit_cloud_generation(event, scene)
+                if event['event_type'] == 'object_entered':
+                    track = next((item for item in scene['tracks']
+                                  if item['track_id'] == event['track_id']), None)
+                    if (track and self._confidence_policy.state(
+                            track['confidence']) == 'accepted'):
+                        self._submit_hud_card({
+                            'event_id': event['event_id'],
+                            'track_id': track['track_id'],
+                            'scene_revision': scene['revision'],
+                            'class_name': track['class_name'],
+                            'display_name': self._display_name(track['class_name']),
+                            'confidence': track['confidence'],
+                            'telemetry': scene.get('telemetry', {}),
+                        })
             if self._loop and self._detection_clients and not self._detection_send_pending:
                 with self._clients_lock:
                     clients = list(self._detection_clients)
@@ -471,6 +500,37 @@ class UnifiedServer:
             *[self._safe_send(ws, message) for ws in clients],
             return_exceptions=True)
 
+    @staticmethod
+    def _display_name(class_name: str) -> str:
+        value = CLASS_DISPLAY_NAMES.get(class_name, class_name)
+        return str(value).strip()[:24] or class_name
+
+    def _submit_hud_card(self, context: dict):
+        cache_key = (context['track_id'], context['class_name'])
+        if cache_key in self._hud_generated or not self._hud_slots.acquire(False):
+            return
+        self._hud_generated.add(cache_key)
+
+        def task():
+            try:
+                try:
+                    card = self._hud_generator.generate(context)
+                except Exception as exc:
+                    log.warning('HUD generation error, using template: %s', exc)
+                    card = self._hud_generator.template(context)
+                if not self._loop or context['track_id'] not in self._active_track_ids:
+                    return
+                with self._clients_lock:
+                    clients = list(self._detection_clients)
+                if clients:
+                    asyncio.run_coroutine_threadsafe(
+                        self._broadcast_auxiliary(json.dumps(card), clients),
+                        self._loop)
+            finally:
+                self._hud_slots.release()
+
+        self._hud_executor.submit(task)
+
     def _maybe_submit_understanding(self, tracks, frame_id: int, revision: int):
         if not self._understanding.enabled:
             return
@@ -518,6 +578,17 @@ class UnifiedServer:
                 }
                 if candidate.track_id not in self._active_track_ids:
                     return
+                if fusion['decision'] in ('accepted', 'reclassified'):
+                    self._submit_hud_card({
+                        'event_id': None,
+                        'track_id': candidate.track_id,
+                        'scene_revision': revision,
+                        'class_name': fusion['effective_class_name'],
+                        'display_name': self._display_name(
+                            fusion['effective_class_name']),
+                        'confidence': fusion['effective_confidence'],
+                        'telemetry': dict(self._latest_telemetry),
+                    })
                 with self._clients_lock:
                     clients = list(self._detection_clients)
                 if clients:

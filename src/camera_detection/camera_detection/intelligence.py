@@ -180,6 +180,122 @@ class TemplateGenerator:
         }
 
 
+class HudCardGenerator:
+    """Generate a validated HUD card through an OpenAI-compatible text model."""
+
+    def __init__(self, url, api_key, model, timeout=3.0, failure_limit=3,
+                 cooldown=30.0):
+        self.url = url.rstrip('/')
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.failure_limit = failure_limit
+        self.cooldown = cooldown
+        self._failures = 0
+        self._open_until = 0.0
+
+    @property
+    def enabled(self):
+        return bool(self.url and self.api_key and self.model)
+
+    def generate(self, context):
+        if not self.enabled or time.monotonic() < self._open_until:
+            return self.template(context)
+        try:
+            content = self._request(context)
+            card = self.build_card(context, content, self.model)
+            self._failures = 0
+            return card
+        except Exception:
+            self._failures += 1
+            if self._failures >= self.failure_limit:
+                self._open_until = time.monotonic() + self.cooldown
+            raise
+
+    def _request(self, context):
+        trusted = {
+            'class_name': context['class_name'],
+            'display_name': context['display_name'],
+            'confidence': context['confidence'],
+            'telemetry': context.get('telemetry', {}),
+        }
+        prompt = (
+            '你是智能车HUD卡片生成器。只能依据给定JSON，不得猜测类别缩写或补充'
+            '未经提供的事实。严格返回一个JSON对象，不要Markdown，格式为：'
+            '{"title":"不超过12字","summary":"不超过40字",'
+            '"facts":[{"label":"不超过8字","value":"不超过16字"}]}。'
+            'facts最多3项。输入：' + json.dumps(trusted, ensure_ascii=False))
+        body = json.dumps({
+            'model': self.model,
+            'messages': [{'role': 'user', 'content': prompt}],
+            'max_tokens': 512, 'temperature': 0.1, 'stream': False,
+            'response_format': {'type': 'json_object'},
+        }).encode('utf-8')
+        request = urllib.request.Request(
+            self.url + '/chat/completions', data=body,
+            headers={'Authorization': f'Bearer {self.api_key}',
+                     'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            data = json.loads(response.read())
+        content = data['choices'][0]['message']['content'].strip()
+        if content.startswith('```'):
+            content = content.strip('`').removeprefix('json').strip()
+        return self.validate_content(json.loads(content))
+
+    @staticmethod
+    def validate_content(content):
+        if not isinstance(content, dict):
+            raise ValueError('HUD response must be an object')
+        if set(content) != {'title', 'summary', 'facts'}:
+            raise ValueError('HUD response has invalid fields')
+        title = str(content['title']).strip()
+        summary = str(content['summary']).strip()
+        facts = content['facts']
+        if not title or len(title) > 24 or not summary or len(summary) > 80:
+            raise ValueError('HUD text is empty or too long')
+        if not isinstance(facts, list) or len(facts) > 3:
+            raise ValueError('HUD facts must be a list with at most 3 items')
+        normalized = []
+        for fact in facts:
+            if not isinstance(fact, dict) or set(fact) != {'label', 'value'}:
+                raise ValueError('HUD fact has invalid fields')
+            label = str(fact['label']).strip()
+            value = str(fact['value']).strip()
+            if not label or len(label) > 16 or not value or len(value) > 32:
+                raise ValueError('HUD fact is empty or too long')
+            normalized.append({'label': label, 'value': value})
+        return {'title': title, 'summary': summary, 'facts': normalized}
+
+    @staticmethod
+    def build_card(context, content, source):
+        now_ms = round(time.time() * 1000)
+        return {
+            'type': 'hud_card', 'version': 1,
+            'card_id': uuid.uuid4().hex,
+            'event_id': context.get('event_id'),
+            'track_id': context['track_id'],
+            'scene_revision': context['scene_revision'],
+            'class_name': context['class_name'],
+            'display_name': context['display_name'],
+            'confidence': round(float(context['confidence']), 4),
+            'source': source,
+            **content,
+            'severity': 'info', 'generated_at': now_ms,
+            'expires_at': now_ms + 15000,
+        }
+
+    @classmethod
+    def template(cls, context):
+        display_name = context['display_name']
+        content = {
+            'title': display_name,
+            'summary': f'检测到{display_name}',
+            'facts': [{'label': '置信度',
+                       'value': f"{float(context['confidence']):.0%}"}],
+        }
+        return cls.build_card(context, content, 'template')
+
+
 class CloudGenerator:
     """OpenAI-compatible event generator with cache and circuit breaker."""
 
