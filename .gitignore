@@ -1,0 +1,27 @@
+# ROS 2 build outputs
+/build/
+/install/
+/log/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts and large model files
+*.log
+*.rknn
+*.onnx
+*.pt
+*.pth
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store

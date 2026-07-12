@@ -1,0 +1,494 @@
+"""
+统一相机视频与目标检测服务。
+
+单进程只打开一次摄像头，一条 GStreamer 管线分成两支：
+- :8765 发送 VJPG 帧头 + 相机原始 JPEG（1080p30）
+- :8766 发送与视频共享 frame_id/PTS 的检测 JSON
+"""
+
+import asyncio
+import json
+import logging
+import os
+import struct
+import threading
+import time
+from collections import OrderedDict
+from typing import Dict
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+
+import numpy as np
+import rclpy
+import websockets
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from sensor_msgs.msg import Imu
+
+from camera_detection.detection_server import (
+    CLASS_NAMES,
+    CONF_THRESH,
+    Detection,
+    INFER_HEIGHT,
+    INFER_WIDTH,
+    NMS_THRESH,
+    RKNNRuntime,
+    decode_ppyoloe,
+)
+
+logging.basicConfig(level=logging.INFO, format='[unified] %(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('unified_server')
+
+VIDEO_DEVICE = os.environ.get('VIDEO_DEVICE', '/dev/video20')
+WIDTH = int(os.environ.get('WIDTH', '1920'))
+HEIGHT = int(os.environ.get('HEIGHT', '1080'))
+FRAMERATE = int(os.environ.get('FRAMERATE', '30'))
+WS_PORT = int(os.environ.get('WS_PORT', '8765'))
+DETECTION_PORT = int(os.environ.get('DETECTION_PORT', '8766'))
+DETECTION_FPS = float(os.environ.get('DETECTION_FPS', '30'))
+TELEMETRY_FPS = float(os.environ.get('TELEMETRY_FPS', '20'))
+IMU_TOPIC = os.environ.get('IMU_TOPIC', '/imu')
+ODOM_TOPIC = os.environ.get('ODOM_TOPIC', '/odom_raw')
+IMU_ACCEL_UNIT = os.environ.get('IMU_ACCEL_UNIT', 'auto').lower()
+RKNN_MODEL = os.environ.get(
+    'RKNN_MODEL',
+    '/home/teamhd/Downloads/ppyoloe_carrace_rk3588_official_split_int8_416.rknn',
+)
+
+
+class TelemetryBridge(Node):
+    """订阅底盘反馈，并向WebSocket侧提供线程安全的最新快照。"""
+
+    GRAVITY = 9.80665
+
+    def __init__(self):
+        super().__init__('camera_telemetry_bridge')
+        self._lock = threading.Lock()
+        self._speed_mps = 0.0
+        self._accel_mps2 = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+        self._imu_updated_at = 0.0
+        self._odom_updated_at = 0.0
+        self.create_subscription(Imu, IMU_TOPIC, self._on_imu, 10)
+        self.create_subscription(Odometry, ODOM_TOPIC, self._on_odom, 10)
+        log.info('ROS telemetry subscriptions imu=%s odom=%s accel_unit=%s',
+                 IMU_TOPIC, ODOM_TOPIC, IMU_ACCEL_UNIT)
+
+    @staticmethod
+    def _accel_scale(x: float, y: float, z: float) -> float:
+        if IMU_ACCEL_UNIT == 'g':
+            return TelemetryBridge.GRAVITY
+        if IMU_ACCEL_UNIT == 'mps2':
+            return 1.0
+        magnitude = (x * x + y * y + z * z) ** 0.5
+        return TelemetryBridge.GRAVITY if 0.5 <= magnitude <= 2.0 else 1.0
+
+    def _on_imu(self, msg: Imu):
+        x = float(msg.linear_acceleration.x)
+        y = float(msg.linear_acceleration.y)
+        z = float(msg.linear_acceleration.z)
+        scale = self._accel_scale(x, y, z)
+        with self._lock:
+            self._accel_mps2 = {'x': x * scale, 'y': y * scale, 'z': z * scale}
+            self._imu_updated_at = time.time()
+
+    def _on_odom(self, msg: Odometry):
+        with self._lock:
+            self._speed_mps = float(msg.twist.twist.linear.x)
+            self._odom_updated_at = time.time()
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self._lock:
+            accel = dict(self._accel_mps2)
+            speed = self._speed_mps
+            imu_age = now - self._imu_updated_at if self._imu_updated_at else None
+            odom_age = now - self._odom_updated_at if self._odom_updated_at else None
+        return {
+            'type': 'telemetry',
+            'stamp_ms': round(now * 1000),
+            'motor_speed_mps': round(speed, 4),
+            'imu_accel_mps2': {key: round(value, 4) for key, value in accel.items()},
+            'imu_stale': imu_age is None or imu_age > 0.5,
+            'motor_speed_stale': odom_age is None or odom_age > 0.5,
+        }
+
+
+class FrameRegistry:
+    """将源帧 PTS 稳定映射为视频与检测共用的 frame_id。"""
+
+    def __init__(self, max_entries: int = 256):
+        self._lock = threading.Lock()
+        self._next_id = 1
+        self._by_pts: OrderedDict[int, int] = OrderedDict()
+        self._max_entries = max_entries
+
+    def resolve(self, pts_ns: int) -> int:
+        with self._lock:
+            frame_id = self._by_pts.get(pts_ns)
+            if frame_id is None:
+                frame_id = self._next_id
+                self._next_id += 1
+                self._by_pts[pts_ns] = frame_id
+                while len(self._by_pts) > self._max_entries:
+                    self._by_pts.popitem(last=False)
+            return frame_id
+
+
+class UnifiedServer:
+    MAGIC = b'VJPG'
+    HEADER_STRUCT = struct.Struct('!4sQQI')
+
+    def __init__(self):
+        Gst.init(None)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._pipeline: Gst.Pipeline | None = None
+        self._video_clients: set = set()
+        self._detection_clients: set = set()
+        self._clients_lock = threading.Lock()
+        self._registry = FrameRegistry()
+        self._rknn: RKNNRuntime | None = None
+        self._running = False
+
+        self._frame_lock = threading.Condition()
+        self._latest_detection_frame: tuple[int, int, float, np.ndarray] | None = None
+        self._detection_sequence = 0
+        self._infer_thread: threading.Thread | None = None
+        self._telemetry_node: TelemetryBridge | None = None
+        self._ros_thread: threading.Thread | None = None
+
+        self._video_send_pending = False
+        self._detection_send_pending = False
+        self._video_count = 0
+        self._video_sent = 0
+        self._video_dropped = 0
+        self._infer_count = 0
+        self._timing_sums: Dict[str, float] = {}
+        self._last_stats_ts = time.time()
+        self._probe_logged = False
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+
+    def _build_pipeline(self) -> str:
+        return (
+            f'v4l2src device={VIDEO_DEVICE} do-timestamp=true '
+            f'! image/jpeg,width={WIDTH},height={HEIGHT},framerate={FRAMERATE}/1 '
+            '! jpegparse ! tee name=t '
+            't. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
+            '! appsink name=video_sink emit-signals=true max-buffers=1 drop=true sync=false '
+            't. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream '
+            '! mppjpegdec format=NV12 fast-mode=true ignore-error=true '
+            f'! videoscale ! video/x-raw,format=NV12,width={INFER_WIDTH},height={INFER_HEIGHT} '
+            '! videoconvert '
+            f'! video/x-raw,format=RGB,width={INFER_WIDTH},height={INFER_HEIGHT} '
+            '! appsink name=detect_sink emit-signals=true max-buffers=1 drop=true sync=false'
+        )
+
+    def start(self):
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        self._telemetry_node = TelemetryBridge()
+        self._ros_thread = threading.Thread(
+            target=rclpy.spin, args=(self._telemetry_node,), daemon=True)
+        self._ros_thread.start()
+        log.info('Loading RKNN model: %s', RKNN_MODEL)
+        self._rknn = RKNNRuntime(RKNN_MODEL)
+        pipeline_str = self._build_pipeline()
+        log.info('Pipeline: %s', pipeline_str)
+        self._pipeline = Gst.parse_launch(pipeline_str)
+        self._pipeline.get_by_name('video_sink').connect('new-sample', self._on_video_sample)
+        self._pipeline.get_by_name('detect_sink').connect('new-sample', self._on_detection_sample)
+
+        bus = self._pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self._on_error)
+        bus.connect('message::eos', self._on_eos)
+        glib_loop = GLib.MainLoop()
+        threading.Thread(target=glib_loop.run, daemon=True).start()
+
+        self._running = True
+        self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
+        self._infer_thread.start()
+        ret = self._pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError('Failed to start unified GStreamer pipeline')
+        log.info('Unified pipeline PLAYING %s %dx%d@%dfps',
+                 VIDEO_DEVICE, WIDTH, HEIGHT, FRAMERATE)
+
+    @staticmethod
+    def _buffer_pts(buf: Gst.Buffer) -> int:
+        return int(buf.pts) if buf.pts != Gst.CLOCK_TIME_NONE else 0
+
+    def _on_video_sample(self, appsink) -> Gst.FlowReturn:
+        sample = appsink.emit('pull-sample')
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+        buf = sample.get_buffer()
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.ERROR
+        jpeg = bytes(mapinfo.data)
+        pts_ns = self._buffer_pts(buf)
+        buf.unmap(mapinfo)
+
+        frame_id = self._registry.resolve(pts_ns)
+        packet = self.HEADER_STRUCT.pack(self.MAGIC, frame_id, pts_ns, len(jpeg)) + jpeg
+        self._video_count += 1
+
+        if not self._probe_logged:
+            log.info('probe frame_id=%d pts_ns=%d jpeg=%d soi=%s eoi=%s',
+                     frame_id, pts_ns, len(jpeg), jpeg[:2].hex(), jpeg[-2:].hex())
+            self._probe_logged = True
+
+        if self._loop and self._video_clients:
+            if self._video_send_pending:
+                self._video_dropped += 1
+            else:
+                with self._clients_lock:
+                    clients = list(self._video_clients)
+                self._video_send_pending = True
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_video(packet, clients), self._loop)
+                self._video_sent += 1
+        self._maybe_log_stats()
+        return Gst.FlowReturn.OK
+
+    def _on_detection_sample(self, appsink) -> Gst.FlowReturn:
+        sample = appsink.emit('pull-sample')
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+        buf = sample.get_buffer()
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.ERROR
+        frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(
+            INFER_HEIGHT, INFER_WIDTH, 3).copy()
+        pts_ns = self._buffer_pts(buf)
+        buf.unmap(mapinfo)
+        frame_id = self._registry.resolve(pts_ns)
+
+        with self._frame_lock:
+            self._detection_sequence += 1
+            self._latest_detection_frame = (frame_id, pts_ns, time.time(), frame)
+            self._frame_lock.notify_all()
+        return Gst.FlowReturn.OK
+
+    def _infer_loop(self):
+        target_interval = 1.0 / max(DETECTION_FPS, 1.0)
+        consumed_sequence = 0
+        while self._running:
+            wait_start = time.perf_counter()
+            with self._frame_lock:
+                while self._running and self._detection_sequence == consumed_sequence:
+                    self._frame_lock.wait(0.1)
+                if not self._running:
+                    return
+                consumed_sequence = self._detection_sequence
+                item = self._latest_detection_frame
+            wait_ms = (time.perf_counter() - wait_start) * 1000
+            if item is None:
+                continue
+            frame_id, pts_ns, capture_ts, frame = item
+
+            infer_start = time.perf_counter()
+            try:
+                outputs, timings = self._rknn.infer(frame)
+                post_start = time.perf_counter()
+                detections = decode_ppyoloe(
+                    outputs, CONF_THRESH, NMS_THRESH, WIDTH, HEIGHT)[:1]
+                timings['post_ms'] = (time.perf_counter() - post_start) * 1000
+            except Exception as exc:
+                log.warning('Inference error: %s', exc)
+                detections = []
+                timings = {}
+            latency_ms = (time.perf_counter() - infer_start) * 1000
+            timings['wait_ms'] = wait_ms
+            timings['infer_total_ms'] = latency_ms
+            self._infer_count += 1
+            for key, value in timings.items():
+                self._timing_sums[key] = self._timing_sums.get(key, 0.0) + value
+
+            message = json.dumps(self._build_detection_payload(
+                detections, latency_ms, frame_id, pts_ns, capture_ts))
+            if self._loop and self._detection_clients and not self._detection_send_pending:
+                with self._clients_lock:
+                    clients = list(self._detection_clients)
+                self._detection_send_pending = True
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_detection(message, clients), self._loop)
+
+            elapsed = time.perf_counter() - infer_start
+            if elapsed < target_interval:
+                time.sleep(target_interval - elapsed)
+            self._maybe_log_stats()
+
+    @staticmethod
+    def _build_detection_payload(detections: list[Detection], latency_ms: float,
+                                 frame_id: int, pts_ns: int, capture_ts: float) -> dict:
+        now = time.time()
+        sec = int(now)
+        cap_sec = int(capture_ts)
+        return {
+            'type': 'detection',
+            'stamp': {'sec': sec, 'nanosec': int((now - sec) * 1e9)},
+            'frame_id': frame_id,
+            'frame_pts_ns': pts_ns,
+            'capture_stamp': {
+                'sec': cap_sec,
+                'nanosec': int((capture_ts - cap_sec) * 1e9),
+            },
+            'latency_ms': round(latency_ms, 2),
+            'input_size': [WIDTH, HEIGHT],
+            'detections': [
+                {
+                    'id': d.id,
+                    'class_name': d.class_name,
+                    'bbox': d.bbox,
+                    'confidence': d.confidence,
+                }
+                for d in detections
+            ],
+        }
+
+    async def _broadcast_video(self, packet: bytes, clients: list):
+        try:
+            await asyncio.gather(
+                *[self._safe_send(ws, packet) for ws in clients],
+                return_exceptions=True)
+        finally:
+            self._video_send_pending = False
+
+    async def _broadcast_detection(self, message: str, clients: list):
+        try:
+            await asyncio.gather(
+                *[self._safe_send(ws, message) for ws in clients],
+                return_exceptions=True)
+        finally:
+            self._detection_send_pending = False
+
+    @staticmethod
+    async def _safe_send(ws, data):
+        await ws.send(data)
+
+    def add_video_client(self, ws):
+        with self._clients_lock:
+            self._video_clients.add(ws)
+        log.info('video client connected total=%d', len(self._video_clients))
+
+    def remove_video_client(self, ws):
+        with self._clients_lock:
+            self._video_clients.discard(ws)
+
+    def add_detection_client(self, ws):
+        with self._clients_lock:
+            self._detection_clients.add(ws)
+        log.info('detection client connected total=%d', len(self._detection_clients))
+
+    def remove_detection_client(self, ws):
+        with self._clients_lock:
+            self._detection_clients.discard(ws)
+
+    def _maybe_log_stats(self):
+        now = time.time()
+        elapsed = now - self._last_stats_ts
+        if elapsed < 5.0:
+            return
+        infer_count = max(self._infer_count, 1)
+        avg = lambda key: self._timing_sums.get(key, 0.0) / infer_count
+        log.info(
+            'stats video_in=%.1ffps video_sent=%.1ffps video_drop=%d '
+            'infer=%.1ffps wait=%.1fms npu=%.1fms total=%.1fms clients=%d/%d',
+            self._video_count / elapsed,
+            self._video_sent / elapsed,
+            self._video_dropped,
+            self._infer_count / elapsed,
+            avg('wait_ms'), avg('npu_ms'), avg('infer_total_ms'),
+            len(self._video_clients), len(self._detection_clients))
+        self._video_count = 0
+        self._video_sent = 0
+        self._video_dropped = 0
+        self._infer_count = 0
+        self._timing_sums.clear()
+        self._last_stats_ts = now
+
+    def _on_error(self, bus, message):
+        err, debug = message.parse_error()
+        log.error('GStreamer error: %s debug=%s', err, debug)
+
+    def _on_eos(self, bus, message):
+        log.warning('GStreamer EOS received')
+
+    def stop(self):
+        self._running = False
+        with self._frame_lock:
+            self._frame_lock.notify_all()
+        if self._pipeline:
+            self._pipeline.set_state(Gst.State.NULL)
+        if self._rknn:
+            self._rknn.close()
+        if self._telemetry_node:
+            self._telemetry_node.destroy_node()
+            self._telemetry_node = None
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    async def telemetry_loop(self):
+        interval = 1.0 / max(TELEMETRY_FPS, 1.0)
+        while self._running:
+            if self._telemetry_node and self._detection_clients:
+                message = json.dumps(self._telemetry_node.snapshot())
+                with self._clients_lock:
+                    clients = list(self._detection_clients)
+                await asyncio.gather(
+                    *[self._safe_send(ws, message) for ws in clients],
+                    return_exceptions=True)
+            await asyncio.sleep(interval)
+
+
+server = UnifiedServer()
+
+
+async def video_handler(websocket):
+    server.add_video_client(websocket)
+    try:
+        await websocket.wait_closed()
+    finally:
+        server.remove_video_client(websocket)
+
+
+async def detection_handler(websocket):
+    server.add_detection_client(websocket)
+    try:
+        await websocket.wait_closed()
+    finally:
+        server.remove_detection_client(websocket)
+
+
+async def serve():
+    server.set_event_loop(asyncio.get_running_loop())
+    server.start()
+    async with websockets.serve(
+        video_handler, '0.0.0.0', WS_PORT, compression=None, max_size=None
+    ), websockets.serve(
+        detection_handler, '0.0.0.0', DETECTION_PORT, compression=None
+    ):
+        log.info('Video WebSocket ws://0.0.0.0:%d', WS_PORT)
+        log.info('Detection WebSocket ws://0.0.0.0:%d', DETECTION_PORT)
+        telemetry_task = asyncio.create_task(server.telemetry_loop())
+        try:
+            await asyncio.Future()
+        finally:
+            telemetry_task.cancel()
+
+
+def main():
+    try:
+        asyncio.run(serve())
+    finally:
+        server.stop()
+
+
+if __name__ == '__main__':
+    main()
