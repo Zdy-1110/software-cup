@@ -48,7 +48,7 @@ set -e
 # ERNIE 文本生成层（可与视觉理解共用 API key，但使用独立模型）
 : "${HUD_API_URL:=https://qianfan.baidubce.com/v2}"
 : "${HUD_API_KEY:=}"
-: "${HUD_API_MODEL:=ernie-5.1}"
+: "${HUD_API_MODEL:=ernie-4.5-turbo-20260402}"
 : "${HUD_API_TIMEOUT:=0.8}"
 : "${HUD_REPEAT_INTERVAL:=3.0}"
 : "${CLASS_DISPLAY_NAMES:={}}"    # JSON，例如 {"bm":"斑马线"}

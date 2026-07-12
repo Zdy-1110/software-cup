@@ -120,7 +120,8 @@ class IntelligenceTest(unittest.TestCase):
         self.assertEqual(card['class_name'], 'nc')
 
     def test_hud_card_binds_trusted_context(self):
-        generator = HudCardGenerator('https://example.test', 'key', 'ernie-5.1')
+        generator = HudCardGenerator(
+            'https://example.test', 'key', 'ernie-4.5-turbo-20260402')
         generator._request = lambda context: {
             'title': '斑马·草原精灵', 'subtitle': '非洲大草原',
             'body': '斑马拥有独特的黑白条纹。',
@@ -134,7 +135,7 @@ class IntelligenceTest(unittest.TestCase):
         self.assertEqual(card['event_id'], 'event-4')
         self.assertEqual(card['track_id'], 8)
         self.assertEqual(card['scene_revision'], 15)
-        self.assertEqual(card['source'], 'ernie-5.1')
+        self.assertEqual(card['source'], 'ernie-4.5-turbo-20260402')
 
     def test_hud_card_rejects_invalid_model_fields(self):
         with self.assertRaises(ValueError):

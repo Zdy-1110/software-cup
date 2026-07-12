@@ -82,7 +82,8 @@ UNDERSTANDING_COOLDOWN = float(os.environ.get('UNDERSTANDING_COOLDOWN', '30'))
 HUD_API_URL = os.environ.get(
     'HUD_API_URL', 'https://qianfan.baidubce.com/v2')
 HUD_API_KEY = os.environ.get('HUD_API_KEY', '')
-HUD_API_MODEL = os.environ.get('HUD_API_MODEL', 'ernie-5.1')
+HUD_API_MODEL = os.environ.get(
+    'HUD_API_MODEL', 'ernie-4.5-turbo-20260402')
 HUD_API_TIMEOUT = float(os.environ.get('HUD_API_TIMEOUT', '0.8'))
 HUD_REPEAT_INTERVAL = float(os.environ.get('HUD_REPEAT_INTERVAL', '3.0'))
 try:
