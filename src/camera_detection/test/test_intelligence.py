@@ -2,7 +2,8 @@ import unittest
 from collections import namedtuple
 
 from camera_detection.intelligence import (
-    CloudGenerator, IoUTracker, SceneEngine, TemplateGenerator)
+    CloudGenerator, IoUTracker, SceneEngine, TemplateGenerator,
+    VisionUnderstandingClient)
 
 
 Detection = namedtuple('Detection', ['id', 'class_name', 'bbox', 'confidence'])
@@ -60,6 +61,20 @@ class IntelligenceTest(unittest.TestCase):
         self.assertEqual(result['event_id'], 'event-2')
         self.assertEqual(result['scene_revision'], 11)
         self.assertEqual(result['source'], 'cloud')
+
+    def test_visual_understanding_disabled_without_key(self):
+        client = VisionUnderstandingClient(
+            'https://qianfan.baidubce.com/v2', '', 'ernie-5.1')
+        self.assertFalse(client.enabled)
+        self.assertIsNone(client.confirm(b'jpeg', {}, ['bm']))
+
+    def test_visual_understanding_rejects_unknown_class(self):
+        result = VisionUnderstandingClient.validate_result({
+            'confirmed': True, 'class_name': 'unknown',
+            'confidence': 1.4, 'reason': 'test'}, ['bm'])
+        self.assertFalse(result['confirmed'])
+        self.assertIsNone(result['class_name'])
+        self.assertEqual(result['confidence'], 1.0)
 
 
 if __name__ == '__main__':

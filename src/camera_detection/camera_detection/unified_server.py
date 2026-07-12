@@ -42,6 +42,7 @@ from camera_detection.intelligence import (
     IoUTracker,
     SceneEngine,
     TemplateGenerator,
+    VisionUnderstandingClient,
 )
 
 logging.basicConfig(level=logging.INFO, format='[unified] %(asctime)s %(levelname)s %(message)s')
@@ -66,6 +67,14 @@ CLOUD_API_URL = os.environ.get('CLOUD_API_URL', '')
 CLOUD_API_KEY = os.environ.get('CLOUD_API_KEY', '')
 CLOUD_API_MODEL = os.environ.get('CLOUD_API_MODEL', '')
 CLOUD_API_TIMEOUT = float(os.environ.get('CLOUD_API_TIMEOUT', '2.5'))
+UNDERSTANDING_API_URL = os.environ.get(
+    'UNDERSTANDING_API_URL', 'https://qianfan.baidubce.com/v2')
+UNDERSTANDING_API_KEY = os.environ.get('UNDERSTANDING_API_KEY', '')
+UNDERSTANDING_MODEL = os.environ.get('UNDERSTANDING_MODEL', 'ernie-5.1')
+UNDERSTANDING_TIMEOUT = float(os.environ.get('UNDERSTANDING_TIMEOUT', '3.0'))
+UNDERSTANDING_CONF_MIN = float(os.environ.get('UNDERSTANDING_CONF_MIN', '0.30'))
+UNDERSTANDING_CONF_MAX = float(os.environ.get('UNDERSTANDING_CONF_MAX', '0.55'))
+UNDERSTANDING_COOLDOWN = float(os.environ.get('UNDERSTANDING_COOLDOWN', '30'))
 
 
 class TelemetryBridge(Node):
@@ -166,6 +175,14 @@ class UnifiedServer:
             CLOUD_API_URL, CLOUD_API_KEY, CLOUD_API_MODEL, CLOUD_API_TIMEOUT)
         self._cloud_executor = ThreadPoolExecutor(max_workers=1)
         self._cloud_slots = threading.BoundedSemaphore(2)
+        self._understanding = VisionUnderstandingClient(
+            UNDERSTANDING_API_URL, UNDERSTANDING_API_KEY,
+            UNDERSTANDING_MODEL, UNDERSTANDING_TIMEOUT)
+        self._understanding_executor = ThreadPoolExecutor(max_workers=1)
+        self._understanding_slot = threading.BoundedSemaphore(1)
+        self._understanding_last: dict[int, float] = {}
+        self._jpeg_lock = threading.Lock()
+        self._jpeg_by_frame: OrderedDict[int, bytes] = OrderedDict()
         self._scene_revision = 0
         self._active_track_ids: set[int] = set()
         self._latest_telemetry: dict = {}
@@ -238,6 +255,9 @@ class UnifiedServer:
                  VIDEO_DEVICE, WIDTH, HEIGHT, FRAMERATE)
         log.info('Cloud generation enabled=%s model=%s',
              self._cloud_generator.enabled, CLOUD_API_MODEL or '-')
+        log.info('Visual understanding enabled=%s model=%s gray_zone=%.2f..%.2f',
+             self._understanding.enabled, UNDERSTANDING_MODEL,
+             UNDERSTANDING_CONF_MIN, UNDERSTANDING_CONF_MAX)
 
     @staticmethod
     def _buffer_pts(buf: Gst.Buffer) -> int:
@@ -256,6 +276,10 @@ class UnifiedServer:
         buf.unmap(mapinfo)
 
         frame_id = self._registry.resolve(pts_ns)
+        with self._jpeg_lock:
+            self._jpeg_by_frame[frame_id] = jpeg
+            while len(self._jpeg_by_frame) > 12:
+                self._jpeg_by_frame.popitem(last=False)
         packet = self.HEADER_STRUCT.pack(self.MAGIC, frame_id, pts_ns, len(jpeg)) + jpeg
         self._video_count += 1
 
@@ -338,6 +362,7 @@ class UnifiedServer:
             self._scene_revision = scene['revision']
             self._active_track_ids = {
                 track['track_id'] for track in scene['tracks']}
+            self._maybe_submit_understanding(tracks, frame_id, scene['revision'])
             messages = [json.dumps(self._build_detection_payload(
                 tracks, latency_ms, frame_id, pts_ns, capture_ts))]
             messages.append(json.dumps(scene))
@@ -439,6 +464,56 @@ class UnifiedServer:
             *[self._safe_send(ws, message) for ws in clients],
             return_exceptions=True)
 
+    def _maybe_submit_understanding(self, tracks, frame_id: int, revision: int):
+        if not self._understanding.enabled:
+            return
+        now = time.monotonic()
+        candidate = next((track for track in tracks
+                          if track.confirmed
+                          and UNDERSTANDING_CONF_MIN <= track.confidence
+                          < UNDERSTANDING_CONF_MAX
+                          and now - self._understanding_last.get(
+                              track.track_id, 0) >= UNDERSTANDING_COOLDOWN), None)
+        if candidate is None or not self._understanding_slot.acquire(False):
+            return
+        with self._jpeg_lock:
+            jpeg = self._jpeg_by_frame.get(frame_id)
+        if jpeg is None:
+            self._understanding_slot.release()
+            return
+        self._understanding_last[candidate.track_id] = now
+        payload = {
+            'track_id': candidate.track_id, 'class_name': candidate.class_name,
+            'confidence': candidate.confidence, 'bbox': candidate.bbox,
+        }
+
+        def task():
+            try:
+                result = self._understanding.confirm(jpeg, payload, CLASS_NAMES)
+                if not result or not self._loop:
+                    return
+                message = {
+                    'type': 'understanding', 'version': 1,
+                    'frame_id': frame_id, 'track_id': candidate.track_id,
+                    'scene_revision': revision, 'source': UNDERSTANDING_MODEL,
+                    'candidate': payload, 'result': result,
+                    'stamp_ms': round(time.time() * 1000),
+                }
+                if candidate.track_id not in self._active_track_ids:
+                    return
+                with self._clients_lock:
+                    clients = list(self._detection_clients)
+                if clients:
+                    asyncio.run_coroutine_threadsafe(
+                        self._broadcast_auxiliary(json.dumps(message), clients),
+                        self._loop)
+            except Exception as exc:
+                log.warning('Visual understanding error: %s', exc)
+            finally:
+                self._understanding_slot.release()
+
+        self._understanding_executor.submit(task)
+
     def add_video_client(self, ws):
         with self._clients_lock:
             self._video_clients.add(ws)
@@ -496,6 +571,7 @@ class UnifiedServer:
         if self._rknn:
             self._rknn.close()
         self._cloud_executor.shutdown(wait=False, cancel_futures=True)
+        self._understanding_executor.shutdown(wait=False, cancel_futures=True)
         if rclpy.ok():
             rclpy.shutdown()
         if self._telemetry_node:

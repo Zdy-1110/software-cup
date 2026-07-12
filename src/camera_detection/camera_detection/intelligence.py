@@ -1,6 +1,7 @@
 """Deterministic scene understanding and local text generation."""
 
 from dataclasses import asdict, dataclass
+import base64
 import json
 import time
 import urllib.request
@@ -211,3 +212,80 @@ class CloudGenerator:
         if not text or len(text) > 60:
             raise ValueError('cloud description is empty or too long')
         return text
+
+
+class VisionUnderstandingClient:
+    """OpenAI-compatible visual confirmation for uncertain detections."""
+
+    def __init__(self, url, api_key, model, timeout=3.0, failure_limit=3,
+                 cooldown=30.0):
+        self.url = url.rstrip('/')
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.failure_limit = failure_limit
+        self.cooldown = cooldown
+        self._failures = 0
+        self._open_until = 0.0
+
+    @property
+    def enabled(self):
+        return bool(self.url and self.api_key and self.model)
+
+    def confirm(self, jpeg, candidate, allowed_classes):
+        if not self.enabled or time.monotonic() < self._open_until:
+            return None
+        try:
+            result = self._request(jpeg, candidate, allowed_classes)
+            self._failures = 0
+            return result
+        except Exception:
+            self._failures += 1
+            if self._failures >= self.failure_limit:
+                self._open_until = time.monotonic() + self.cooldown
+            raise
+
+    def _request(self, jpeg, candidate, allowed_classes):
+        encoded = base64.b64encode(jpeg).decode('ascii')
+        prompt = (
+            '你是智能车赛道视觉复核器。候选检测结果为：' +
+            json.dumps(candidate, ensure_ascii=False) +
+            '。只允许从以下类别中确认：' + ','.join(allowed_classes) +
+            '。观察候选框附近目标，严格返回JSON对象，不要Markdown：'
+            '{"confirmed":true,"class_name":"类别","confidence":0.0,'
+            '"reason":"不超过30字"}。无法确认时confirmed为false。')
+        body = json.dumps({
+            'model': self.model,
+            'messages': [{'role': 'user', 'content': [
+                {'type': 'text', 'text': prompt},
+                {'type': 'image_url', 'image_url': {
+                    'url': 'data:image/jpeg;base64,' + encoded}},
+            ]}],
+            'max_tokens': 120,
+            'temperature': 0.1,
+            'stream': False,
+        }).encode('utf-8')
+        request = urllib.request.Request(
+            self.url + '/chat/completions', data=body,
+            headers={'Authorization': f'Bearer {self.api_key}',
+                     'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            data = json.loads(response.read())
+        content = data['choices'][0]['message']['content'].strip()
+        if content.startswith('```'):
+            content = content.strip('`').removeprefix('json').strip()
+        return self.validate_result(json.loads(content), allowed_classes)
+
+    @staticmethod
+    def validate_result(result, allowed_classes):
+        if not isinstance(result, dict):
+            raise ValueError('visual understanding response must be an object')
+        class_name = result.get('class_name')
+        if class_name not in allowed_classes:
+            result['confirmed'] = False
+            result['class_name'] = None
+        else:
+            result['confirmed'] = bool(result.get('confirmed', False))
+        result['confidence'] = max(0.0, min(1.0, float(result.get('confidence', 0))))
+        result['reason'] = str(result.get('reason', ''))[:60]
+        return result
