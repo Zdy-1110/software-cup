@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass
 import base64
+from collections import OrderedDict
 import json
 import time
 import urllib.request
@@ -184,6 +185,56 @@ class ConfidencePolicy:
             'effective_confidence': round(
                 model_confidence * 0.55 + vision_confidence * 0.45, 4),
         }
+
+
+class AcceptanceGate:
+    """Emit once after a track remains accepted for consecutive updates."""
+
+    def __init__(self, required_hits=3):
+        self.required_hits = required_hits
+        self._hits = {}
+        self._emitted = set()
+
+    def update(self, tracks, policy):
+        active_ids = {track.track_id for track in tracks}
+        accepted = []
+        for track in tracks:
+            key = (track.track_id, track.class_name)
+            if policy.state(track.confidence) == 'accepted':
+                self._hits[key] = self._hits.get(key, 0) + 1
+                if self._hits[key] >= self.required_hits and key not in self._emitted:
+                    self._emitted.add(key)
+                    accepted.append(track)
+            else:
+                self._hits.pop(key, None)
+        self._hits = {
+            key: hits for key, hits in self._hits.items()
+            if key[0] in active_ids
+        }
+        self._emitted = {key for key in self._emitted if key[0] in active_ids}
+        return accepted
+
+
+class HudCardStore:
+    """Keep currently valid cards for reconnecting clients."""
+
+    def __init__(self, max_cards=3):
+        self.max_cards = max_cards
+        self._cards = OrderedDict()
+
+    def put(self, card, now_ms=None):
+        now_ms = now_ms or round(time.time() * 1000)
+        self.valid(now_ms)
+        self._cards[card['card_id']] = card
+        while len(self._cards) > self.max_cards:
+            self._cards.popitem(last=False)
+
+    def valid(self, now_ms=None):
+        now_ms = now_ms or round(time.time() * 1000)
+        self._cards = OrderedDict(
+            (card_id, card) for card_id, card in self._cards.items()
+            if card['expires_at'] > now_ms)
+        return list(self._cards.values())
 
 
 class SceneEngine:

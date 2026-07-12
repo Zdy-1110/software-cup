@@ -2,8 +2,9 @@ import unittest
 from collections import namedtuple
 
 from camera_detection.intelligence import (
-    CloudGenerator, ConfidencePolicy, HudCardGenerator, IoUTracker, SceneEngine,
-    LANDMARK_CARDS, TemplateGenerator, VisionUnderstandingClient)
+    AcceptanceGate, CloudGenerator, ConfidencePolicy, HudCardGenerator,
+    HudCardStore, IoUTracker, LANDMARK_CARDS, SceneEngine, TemplateGenerator,
+    VisionUnderstandingClient)
 
 
 Detection = namedtuple('Detection', ['id', 'class_name', 'bbox', 'confidence'])
@@ -163,6 +164,40 @@ class IntelligenceTest(unittest.TestCase):
             self.assertLessEqual(len(metadata['body']), 60)
             self.assertLessEqual(len(metadata['cta']), 12)
             self.assertGreaterEqual(len(metadata['tags']), 1)
+
+    def test_acceptance_gate_requires_three_consecutive_updates(self):
+        gate = AcceptanceGate(required_hits=3)
+        policy = ConfidencePolicy(0.25, 0.60)
+        for frame in range(3):
+            tracks = self.tracker.update([self.detection], 1000 + frame)
+        track = tracks[0]
+        track.confidence = 0.61
+        self.assertEqual(gate.update([track], policy), [])
+        self.assertEqual(gate.update([track], policy), [])
+        self.assertEqual(gate.update([track], policy), [track])
+        self.assertEqual(gate.update([track], policy), [])
+
+    def test_acceptance_gate_resets_after_review(self):
+        gate = AcceptanceGate(required_hits=2)
+        policy = ConfidencePolicy(0.25, 0.60)
+        for frame in range(3):
+            tracks = self.tracker.update([self.detection], 1000 + frame)
+        track = tracks[0]
+        track.confidence = 0.61
+        gate.update([track], policy)
+        track.confidence = 0.59
+        gate.update([track], policy)
+        track.confidence = 0.61
+        self.assertEqual(gate.update([track], policy), [])
+        self.assertEqual(gate.update([track], policy), [track])
+
+    def test_hud_card_store_limits_and_expires_cards(self):
+        store = HudCardStore(max_cards=3)
+        for index in range(4):
+            store.put({'card_id': str(index), 'expires_at': 2000 + index}, 1000)
+        self.assertEqual(
+            [card['card_id'] for card in store.valid(1000)], ['1', '2', '3'])
+        self.assertEqual(store.valid(2003), [])
 
 
 if __name__ == '__main__':

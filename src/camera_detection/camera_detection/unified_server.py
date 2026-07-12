@@ -38,9 +38,11 @@ from camera_detection.detection_server import (
     decode_ppyoloe,
 )
 from camera_detection.intelligence import (
+    AcceptanceGate,
     CloudGenerator,
     ConfidencePolicy,
     HudCardGenerator,
+    HudCardStore,
     IoUTracker,
     LANDMARK_CARDS,
     SceneEngine,
@@ -203,6 +205,8 @@ class UnifiedServer:
         self._hud_executor = ThreadPoolExecutor(max_workers=1)
         self._hud_slots = threading.BoundedSemaphore(2)
         self._hud_last_by_class: dict[str, float] = {}
+        self._acceptance_gate = AcceptanceGate(required_hits=3)
+        self._hud_cards = HudCardStore(max_cards=3)
         self._jpeg_lock = threading.Lock()
         self._jpeg_by_frame: OrderedDict[int, bytes] = OrderedDict()
         self._scene_revision = 0
@@ -385,6 +389,17 @@ class UnifiedServer:
             self._active_track_ids = {
                 track['track_id'] for track in scene['tracks']}
             self._maybe_submit_understanding(tracks, frame_id, scene['revision'])
+            for track in self._acceptance_gate.update(
+                    self._tracker.active(), self._confidence_policy):
+                self._submit_hud_card({
+                    'event_id': None,
+                    'track_id': track.track_id,
+                    'scene_revision': scene['revision'],
+                    'class_name': track.class_name,
+                    'display_name': self._display_name(track.class_name),
+                    'confidence': track.confidence,
+                    'telemetry': scene.get('telemetry', {}),
+                })
             messages = [json.dumps(self._build_detection_payload(
                 tracks, latency_ms, frame_id, pts_ns, capture_ts))]
             messages.append(json.dumps(scene))
@@ -393,20 +408,6 @@ class UnifiedServer:
                 messages.append(json.dumps(
                     self._template_generator.generate(event, scene['revision'])))
                 self._submit_cloud_generation(event, scene)
-                if event['event_type'] == 'object_entered':
-                    track = next((item for item in scene['tracks']
-                                  if item['track_id'] == event['track_id']), None)
-                    if (track and self._confidence_policy.state(
-                            track['confidence']) == 'accepted'):
-                        self._submit_hud_card({
-                            'event_id': event['event_id'],
-                            'track_id': track['track_id'],
-                            'scene_revision': scene['revision'],
-                            'class_name': track['class_name'],
-                            'display_name': self._display_name(track['class_name']),
-                            'confidence': track['confidence'],
-                            'telemetry': scene.get('telemetry', {}),
-                        })
             if self._loop and self._detection_clients and not self._detection_send_pending:
                 with self._clients_lock:
                     clients = list(self._detection_clients)
@@ -528,6 +529,7 @@ class UnifiedServer:
                     card = self._hud_generator.template(context)
                 if not self._loop or context['track_id'] not in self._active_track_ids:
                     return
+                self._hud_cards.put(card)
                 with self._clients_lock:
                     clients = list(self._detection_clients)
                 if clients:
@@ -623,6 +625,10 @@ class UnifiedServer:
         with self._clients_lock:
             self._detection_clients.add(ws)
         log.info('detection client connected total=%d', len(self._detection_clients))
+        if self._loop:
+            for card in self._hud_cards.valid():
+                asyncio.run_coroutine_threadsafe(
+                    self._safe_send(ws, json.dumps(card)), self._loop)
 
     def remove_detection_client(self, ws):
         with self._clients_lock:
