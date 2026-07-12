@@ -7,6 +7,7 @@
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -30,12 +31,17 @@ from sensor_msgs.msg import Imu
 from camera_detection.detection_server import (
     CLASS_NAMES,
     CONF_THRESH,
-    Detection,
     INFER_HEIGHT,
     INFER_WIDTH,
     NMS_THRESH,
     RKNNRuntime,
     decode_ppyoloe,
+)
+from camera_detection.intelligence import (
+    CloudGenerator,
+    IoUTracker,
+    SceneEngine,
+    TemplateGenerator,
 )
 
 logging.basicConfig(level=logging.INFO, format='[unified] %(asctime)s %(levelname)s %(message)s')
@@ -56,6 +62,10 @@ RKNN_MODEL = os.environ.get(
     'RKNN_MODEL',
     '/home/teamhd/Downloads/ppyoloe_carrace_rk3588_official_split_int8_416.rknn',
 )
+CLOUD_API_URL = os.environ.get('CLOUD_API_URL', '')
+CLOUD_API_KEY = os.environ.get('CLOUD_API_KEY', '')
+CLOUD_API_MODEL = os.environ.get('CLOUD_API_MODEL', '')
+CLOUD_API_TIMEOUT = float(os.environ.get('CLOUD_API_TIMEOUT', '2.5'))
 
 
 class TelemetryBridge(Node):
@@ -149,6 +159,16 @@ class UnifiedServer:
         self._clients_lock = threading.Lock()
         self._registry = FrameRegistry()
         self._rknn: RKNNRuntime | None = None
+        self._tracker = IoUTracker()
+        self._scene_engine = SceneEngine()
+        self._template_generator = TemplateGenerator()
+        self._cloud_generator = CloudGenerator(
+            CLOUD_API_URL, CLOUD_API_KEY, CLOUD_API_MODEL, CLOUD_API_TIMEOUT)
+        self._cloud_executor = ThreadPoolExecutor(max_workers=1)
+        self._cloud_slots = threading.BoundedSemaphore(2)
+        self._scene_revision = 0
+        self._active_track_ids: set[int] = set()
+        self._latest_telemetry: dict = {}
         self._running = False
 
         self._frame_lock = threading.Condition()
@@ -216,6 +236,8 @@ class UnifiedServer:
             raise RuntimeError('Failed to start unified GStreamer pipeline')
         log.info('Unified pipeline PLAYING %s %dx%d@%dfps',
                  VIDEO_DEVICE, WIDTH, HEIGHT, FRAMERATE)
+        log.info('Cloud generation enabled=%s model=%s',
+             self._cloud_generator.enabled, CLOUD_API_MODEL or '-')
 
     @staticmethod
     def _buffer_pts(buf: Gst.Buffer) -> int:
@@ -297,7 +319,7 @@ class UnifiedServer:
                 outputs, timings = self._rknn.infer(frame)
                 post_start = time.perf_counter()
                 detections = decode_ppyoloe(
-                    outputs, CONF_THRESH, NMS_THRESH, WIDTH, HEIGHT)[:1]
+                    outputs, CONF_THRESH, NMS_THRESH, WIDTH, HEIGHT)
                 timings['post_ms'] = (time.perf_counter() - post_start) * 1000
             except Exception as exc:
                 log.warning('Inference error: %s', exc)
@@ -310,14 +332,26 @@ class UnifiedServer:
             for key, value in timings.items():
                 self._timing_sums[key] = self._timing_sums.get(key, 0.0) + value
 
-            message = json.dumps(self._build_detection_payload(
-                detections, latency_ms, frame_id, pts_ns, capture_ts))
+            tracks = self._tracker.update(detections)
+            scene, events = self._scene_engine.update(
+                self._tracker.active(), frame_id, self._latest_telemetry)
+            self._scene_revision = scene['revision']
+            self._active_track_ids = {
+                track['track_id'] for track in scene['tracks']}
+            messages = [json.dumps(self._build_detection_payload(
+                tracks, latency_ms, frame_id, pts_ns, capture_ts))]
+            messages.append(json.dumps(scene))
+            for event in events:
+                messages.append(json.dumps(event))
+                messages.append(json.dumps(
+                    self._template_generator.generate(event, scene['revision'])))
+                self._submit_cloud_generation(event, scene)
             if self._loop and self._detection_clients and not self._detection_send_pending:
                 with self._clients_lock:
                     clients = list(self._detection_clients)
                 self._detection_send_pending = True
                 asyncio.run_coroutine_threadsafe(
-                    self._broadcast_detection(message, clients), self._loop)
+                    self._broadcast_detection(messages, clients), self._loop)
 
             elapsed = time.perf_counter() - infer_start
             if elapsed < target_interval:
@@ -325,13 +359,14 @@ class UnifiedServer:
             self._maybe_log_stats()
 
     @staticmethod
-    def _build_detection_payload(detections: list[Detection], latency_ms: float,
+    def _build_detection_payload(detections: list, latency_ms: float,
                                  frame_id: int, pts_ns: int, capture_ts: float) -> dict:
         now = time.time()
         sec = int(now)
         cap_sec = int(capture_ts)
         return {
             'type': 'detection',
+            'version': 1,
             'stamp': {'sec': sec, 'nanosec': int((now - sec) * 1e9)},
             'frame_id': frame_id,
             'frame_pts_ns': pts_ns,
@@ -343,7 +378,8 @@ class UnifiedServer:
             'input_size': [WIDTH, HEIGHT],
             'detections': [
                 {
-                    'id': d.id,
+                    'id': d.track_id,
+                    'track_id': d.track_id,
                     'class_name': d.class_name,
                     'bbox': d.bbox,
                     'confidence': d.confidence,
@@ -360,17 +396,48 @@ class UnifiedServer:
         finally:
             self._video_send_pending = False
 
-    async def _broadcast_detection(self, message: str, clients: list):
+    async def _broadcast_detection(self, messages: list[str], clients: list):
         try:
-            await asyncio.gather(
-                *[self._safe_send(ws, message) for ws in clients],
-                return_exceptions=True)
+            for message in messages:
+                await asyncio.gather(
+                    *[self._safe_send(ws, message) for ws in clients],
+                    return_exceptions=True)
         finally:
             self._detection_send_pending = False
 
     @staticmethod
     async def _safe_send(ws, data):
         await ws.send(data)
+
+    def _submit_cloud_generation(self, event: dict, scene: dict):
+        if not self._cloud_generator.enabled or not self._cloud_slots.acquire(False):
+            return
+
+        def task():
+            try:
+                result = self._cloud_generator.generate(event, scene)
+                if not result or not self._loop:
+                    return
+                track_id = result.get('track_id')
+                if (track_id is not None and track_id not in self._active_track_ids
+                        or self._scene_revision - result['scene_revision'] > 60):
+                    return
+                with self._clients_lock:
+                    clients = list(self._detection_clients)
+                if clients:
+                    asyncio.run_coroutine_threadsafe(
+                        self._broadcast_auxiliary(json.dumps(result), clients), self._loop)
+            except Exception as exc:
+                log.warning('Cloud generation error: %s', exc)
+            finally:
+                self._cloud_slots.release()
+
+        self._cloud_executor.submit(task)
+
+    async def _broadcast_auxiliary(self, message: str, clients: list):
+        await asyncio.gather(
+            *[self._safe_send(ws, message) for ws in clients],
+            return_exceptions=True)
 
     def add_video_client(self, ws):
         with self._clients_lock:
@@ -428,17 +495,19 @@ class UnifiedServer:
             self._pipeline.set_state(Gst.State.NULL)
         if self._rknn:
             self._rknn.close()
+        self._cloud_executor.shutdown(wait=False, cancel_futures=True)
+        if rclpy.ok():
+            rclpy.shutdown()
         if self._telemetry_node:
             self._telemetry_node.destroy_node()
             self._telemetry_node = None
-        if rclpy.ok():
-            rclpy.shutdown()
 
     async def telemetry_loop(self):
         interval = 1.0 / max(TELEMETRY_FPS, 1.0)
         while self._running:
             if self._telemetry_node and self._detection_clients:
-                message = json.dumps(self._telemetry_node.snapshot())
+                self._latest_telemetry = self._telemetry_node.snapshot()
+                message = json.dumps(self._latest_telemetry)
                 with self._clients_lock:
                     clients = list(self._detection_clients)
                 await asyncio.gather(

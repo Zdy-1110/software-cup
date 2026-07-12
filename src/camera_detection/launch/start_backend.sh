@@ -23,6 +23,7 @@ set -e
 : "${LOG_DIR:=/tmp/camera_detection_logs}"
 : "${VIDEO_SHM_SOCKET:=/tmp/camera_video.shm}"
 : "${DETECT_SHM_SOCKET:=/tmp/camera_detect.shm}"
+: "${PID_FILE:=/tmp/camera_detection_unified.pid}"
 
 # ── 云端 API 配置（可选，留空则关闭）───────────────────────────────────
 # 示例（阿里云）:
@@ -33,7 +34,7 @@ set -e
 : "${CLOUD_API_URL:=}"
 : "${CLOUD_API_KEY:=}"
 : "${CLOUD_API_MODEL:=qwen-turbo}"
-: "${CLOUD_API_DEBOUNCE:=30}"
+: "${CLOUD_API_TIMEOUT:=2.5}"
 
 MODE=${1:-all}    # video | detect | all
 
@@ -51,7 +52,7 @@ fi
 export VIDEO_DEVICE H264_BITRATE H264_GOP WS_PORT DETECTION_PORT RKNN_MODEL CONF_THRESH CLASS_NAMES
 export VIDEO_SHM_SOCKET DETECT_SHM_SOCKET
 export DETECTION_FPS TELEMETRY_FPS ROS_DOMAIN_ID IMU_TOPIC ODOM_TOPIC IMU_ACCEL_UNIT
-export CLOUD_API_URL CLOUD_API_KEY CLOUD_API_MODEL CLOUD_API_DEBOUNCE
+export CLOUD_API_URL CLOUD_API_KEY CLOUD_API_MODEL CLOUD_API_TIMEOUT
 
 # ── 检查摄像头 ───────────────────────────────────────────────
 if [ ! -e "$VIDEO_DEVICE" ]; then
@@ -68,14 +69,41 @@ if [ ! -f "$RKNN_MODEL" ]; then
 fi
 
 # ── 启动函数 ─────────────────────────────────────────────────
+stop_pid() {
+    local pid="${1:-}"
+    [ -n "$pid" ] || return 0
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.2
+    done
+    echo "[WARN] PID $pid 未及时退出，执行强制停止"
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+stop_existing_unified() {
+    [ -f "$PID_FILE" ] || return 0
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] && \
+       tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q 'camera_detection.unified_server'; then
+        echo "[INFO] 停止旧统一后端 PID=$pid"
+        stop_pid "$pid"
+    fi
+    rm -f "$PID_FILE"
+}
+
 start_all() {
     echo "[INFO] 启动统一后端 (single capture + video + detection)"
     echo "[INFO]   视频流  ws://0.0.0.0:${WS_PORT}"
     echo "[INFO]   检测    ws://0.0.0.0:${DETECTION_PORT}"
 
+    stop_existing_unified
     PYTHONPATH="$SCRIPT_DIR/..:${PYTHONPATH:-}" python3 -m camera_detection.unified_server \
         >> "$LOG_DIR/unified_server.log" 2>&1 &
     UNIFIED_PID=$!
+    echo "$UNIFIED_PID" > "$PID_FILE"
     echo "[INFO] unified_server PID=$UNIFIED_PID  log=$LOG_DIR/unified_server.log"
 }
 
@@ -98,11 +126,11 @@ start_detect() {
 trap_exit() {
     echo ""
     echo "[INFO] 正在停止服务..."
-    [ -n "${UNIFIED_PID:-}" ] && kill "$UNIFIED_PID" 2>/dev/null || true
-    [ -n "${DETECT_PID:-}" ] && kill "$DETECT_PID" 2>/dev/null || true
-    [ -n "${VIDEO_PID:-}"  ] && kill "$VIDEO_PID"  2>/dev/null || true
-    [ -n "${RELAY_PID:-}"  ] && kill "$RELAY_PID"  2>/dev/null || true
-    rm -f "$VIDEO_SHM_SOCKET" "$DETECT_SHM_SOCKET"
+    [ -n "${UNIFIED_PID:-}" ] && stop_pid "$UNIFIED_PID"
+    [ -n "${DETECT_PID:-}" ] && stop_pid "$DETECT_PID"
+    [ -n "${VIDEO_PID:-}"  ] && stop_pid "$VIDEO_PID"
+    [ -n "${RELAY_PID:-}"  ] && stop_pid "$RELAY_PID"
+    rm -f "$PID_FILE" "$VIDEO_SHM_SOCKET" "$DETECT_SHM_SOCKET"
     exit 0
 }
 trap trap_exit INT TERM
